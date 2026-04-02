@@ -28,8 +28,8 @@ use std::convert::TryFrom;
 use wasmer_compiler::wasmparser::HeapType;
 use wasmer_types::{
     FunctionIndex, FunctionType, GlobalIndex, LocalFunctionIndex, MemoryIndex, MemoryStyle,
-    ModuleInfo, SignatureIndex, TableIndex, TableStyle, TagIndex, Type as WasmerType,
-    VMBuiltinFunctionIndex, VMOffsets, WasmError, WasmResult,
+    ModuleInfo, SignatureHash, SignatureIndex, TableIndex, TableStyle, TagIndex,
+    Type as WasmerType, VMBuiltinFunctionIndex, VMOffsets, WasmError, WasmResult,
     entity::{EntityRef, PrimaryMap, SecondaryMap},
 };
 
@@ -71,6 +71,9 @@ pub struct FuncEnvironment<'module_environment> {
 
     /// The module function signatures
     signatures: &'module_environment PrimaryMap<SignatureIndex, ir::Signature>,
+
+    /// Cached stable hashes for module signatures.
+    signature_hashes: &'module_environment PrimaryMap<SignatureIndex, SignatureHash>,
 
     /// Heaps implementing WebAssembly linear memories.
     heaps: PrimaryMap<Heap, HeapData>,
@@ -140,6 +143,7 @@ pub struct FuncEnvironment<'module_environment> {
     memory32_atomic_notify_sig: Option<ir::SigRef>,
 
     /// Cached signatures for exception helper builtins.
+    raise_trap_sig: Option<ir::SigRef>,
     personality2_sig: Option<ir::SigRef>,
     throw_sig: Option<ir::SigRef>,
     alloc_exception_sig: Option<ir::SigRef>,
@@ -166,6 +170,7 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
         target_config: TargetFrontendConfig,
         module: &'module_environment ModuleInfo,
         signatures: &'module_environment PrimaryMap<SignatureIndex, ir::Signature>,
+        signature_hashes: &'module_environment PrimaryMap<SignatureIndex, SignatureHash>,
         memory_styles: &'module_environment PrimaryMap<MemoryIndex, MemoryStyle>,
         table_styles: &'module_environment PrimaryMap<TableIndex, TableStyle>,
     ) -> Self {
@@ -173,6 +178,7 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
             target_config,
             module,
             signatures,
+            signature_hashes,
             type_stack: vec![],
             heaps: PrimaryMap::new(),
             vmctx: None,
@@ -194,6 +200,7 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
             memory32_atomic_wait32_sig: None,
             memory32_atomic_wait64_sig: None,
             memory32_atomic_notify_sig: None,
+            raise_trap_sig: None,
             personality2_sig: None,
             throw_sig: None,
             alloc_exception_sig: None,
@@ -1008,6 +1015,17 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
         (sig, VMBuiltinFunctionIndex::get_imported_throw_index())
     }
 
+    fn get_raise_trap_func(&mut self, func: &mut Function) -> (ir::SigRef, VMBuiltinFunctionIndex) {
+        let sig = self.raise_trap_sig.unwrap_or_else(|| {
+            let mut signature = Signature::new(self.target_config.default_call_conv);
+            signature.params.push(AbiParam::new(I32));
+            let sig = func.import_signature(signature);
+            self.raise_trap_sig = Some(sig);
+            sig
+        });
+        (sig, VMBuiltinFunctionIndex::get_raise_trap_index())
+    }
+
     fn get_alloc_exception_func(
         &mut self,
         func: &mut Function,
@@ -1311,6 +1329,22 @@ impl BaseFuncEnvironment for FuncEnvironment<'_> {
     fn is_wasm_parameter(&self, _signature: &ir::Signature, index: usize) -> bool {
         // The first parameter is the vmctx. The rest are the wasm parameters.
         index >= 1
+    }
+
+    fn translate_unreachable(&mut self, builder: &mut FunctionBuilder) -> WasmResult<()> {
+        let (func_sig, func_idx) = self.get_raise_trap_func(builder.func);
+        let mut pos = builder.cursor();
+        let (_, func_addr) = self.translate_load_builtin_function_address(&mut pos, func_idx);
+        let trap_code = pos
+            .ins()
+            .iconst(I32, wasmer_types::TrapCode::UnreachableCodeReached as i64);
+        builder
+            .ins()
+            .call_indirect(func_sig, func_addr, &[trap_code]);
+        // Emit the terminator through `FunctionBuilder` so its block state is
+        // updated before later control-flow translation switches blocks.
+        builder.ins().trap(crate::TRAP_UNREACHABLE);
+        Ok(())
     }
 
     fn translate_table_grow(
@@ -1660,31 +1694,25 @@ impl BaseFuncEnvironment for FuncEnvironment<'_> {
         // If necessary, check the signature.
         match self.table_styles[table_index] {
             TableStyle::CallerChecksSignature => {
-                let sig_id_size = self.offsets.size_of_vmshared_signature_index();
-                let sig_id_type = ir::Type::int(u16::from(sig_id_size) * 8).unwrap();
-                let vmctx = self.vmctx(builder.func);
-                let base = builder.ins().global_value(pointer_type, vmctx);
-                let offset =
-                    i32::try_from(self.offsets.vmctx_vmshared_signature_id(sig_index)).unwrap();
-
-                // Load the caller ID.
-                let mut mem_flags = ir::MemFlags::trusted();
-                mem_flags.set_readonly();
-                let caller_sig_id = builder.ins().load(sig_id_type, mem_flags, base, offset);
+                let sig_hash_type = ir::types::I32;
+                let expected_sig_hash = builder.ins().iconst(
+                    sig_hash_type,
+                    i64::from(self.signature_hashes[sig_index].as_u32()),
+                );
 
                 // Load the callee ID.
                 let mem_flags = ir::MemFlags::trusted();
-                let callee_sig_id = builder.ins().load(
-                    sig_id_type,
+                let callee_sig_hash = builder.ins().load(
+                    sig_hash_type,
                     mem_flags,
                     anyfunc_ptr,
-                    i32::from(self.offsets.vmcaller_checked_anyfunc_type_index()),
+                    i32::from(self.offsets.vmcaller_checked_anyfunc_signature_hash()),
                 );
 
                 // Check that they match.
                 let cmp = builder
                     .ins()
-                    .icmp(IntCC::Equal, callee_sig_id, caller_sig_id);
+                    .icmp(IntCC::Equal, callee_sig_hash, expected_sig_hash);
                 builder.ins().trapz(cmp, crate::TRAP_BAD_SIGNATURE);
             }
         }
